@@ -187,3 +187,43 @@ async def debug_pdf(file: UploadFile = File(...)):
 
     except Exception as e:
         raise HTTPException(400, str(e))
+import pytesseract
+from PIL import Image
+
+@app.post("/ocr-test")
+async def ocr_test(file: UploadFile = File(...)):
+    data = await file.read()
+
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(400, "Please upload a PDF file")
+
+    try:
+        pdf = fitz.open(stream=data, filetype="pdf")
+        results = []
+
+        for page_number, page in enumerate(pdf, start=1):
+            pix = page.get_pixmap(
+                matrix=fitz.Matrix(2, 2),
+                alpha=False
+            )
+
+            image = Image.open(io.BytesIO(pix.tobytes("png")))
+
+            text = pytesseract.image_to_string(
+                image,
+                lang="ben+eng"
+            )
+
+            results.append({
+                "page": page_number,
+                "text": text
+            })
+
+        return {
+            "filename": file.filename,
+            "pages": len(results),
+            "ocr_text": results
+        }
+
+    except Exception as e:
+        raise HTTPException(400, f"OCR failed: {str(e)}")
