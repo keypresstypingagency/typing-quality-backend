@@ -5,3 +5,4 @@ PyMuPDF==1.25.3
 python-multipart==0.0.20
 fonttools==4.58.0
 pytesseract==0.3.13
+Pillow==11.2.1
