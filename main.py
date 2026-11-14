@@ -89,3 +89,57 @@ async def extract_file(file: UploadFile = File(...)):
             status_code=400,
             detail=f"Could not extract text: {str(e)}"
         )
+
+from fontTools.ttLib import TTFont
+
+@app.post("/pdf-fonts")
+async def check_pdf_fonts(file: UploadFile = File(...)):
+    data = await file.read()
+
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(400, "Please upload a PDF file")
+
+    try:
+        pdf = fitz.open(stream=data, filetype="pdf")
+        results = []
+
+        for page_number, page in enumerate(pdf, start=1):
+            for font in page.get_fonts(full=True):
+                xref = font[0]
+
+                item = {
+                    "page": page_number,
+                    "font_name": font[3],
+                    "font_type": font[2],
+                    "encoding": font[5],
+                    "unicode_cmap": "Unknown"
+                }
+
+                try:
+                    extracted = pdf.extract_font(xref)
+                    font_data = extracted[3]
+
+                    if font_data:
+                        font_obj = TTFont(
+                            io.BytesIO(font_data),
+                            lazy=True
+                        )
+                        item["unicode_cmap"] = any(
+                            table.isUnicode()
+                            for table in font_obj["cmap"].tables
+                        )
+                        font_obj.close()
+
+                except Exception:
+                    item["unicode_cmap"] = "Could not inspect"
+
+                results.append(item)
+
+        return {
+            "filename": file.filename,
+            "fonts_found": len(results),
+            "fonts": results
+        }
+
+    except Exception as e:
+        raise HTTPException(400, str(e))
