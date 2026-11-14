@@ -143,3 +143,47 @@ async def check_pdf_fonts(file: UploadFile = File(...)):
 
     except Exception as e:
         raise HTTPException(400, str(e))
+
+@app.post("/pdf-debug")
+async def debug_pdf(file: UploadFile = File(...)):
+    data = await file.read()
+
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(400, "Please upload a PDF file")
+
+    try:
+        pdf = fitz.open(stream=data, filetype="pdf")
+        results = []
+
+        for page_number, page in enumerate(pdf, start=1):
+            page_data = {
+                "page": page_number,
+                "extracted_text": page.get_text("text"),
+                "text_spans": []
+            }
+
+            blocks = page.get_text("dict")["blocks"]
+
+            for block in blocks:
+                if "lines" not in block:
+                    continue
+
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        page_data["text_spans"].append({
+                            "text": span["text"],
+                            "font": span["font"],
+                            "size": span["size"],
+                            "bbox": list(span["bbox"])
+                        })
+
+            results.append(page_data)
+
+        return {
+            "filename": file.filename,
+            "pages": len(results),
+            "debug": results
+        }
+
+    except Exception as e:
+        raise HTTPException(400, str(e))
