@@ -263,3 +263,52 @@ async def ocr_test(file: UploadFile = File(...)):
         "pages": len(results),
         "ocr_text": results
     }
+
+@app.post("/compare")
+async def compare_files(
+    original_file: UploadFile = File(...),
+    typed_file: UploadFile = File(...)
+):
+    try:
+        original_data = await original_file.read()
+        typed_data = await typed_file.read()
+
+        original_text = extract_docx(original_data)
+        typed_text = extract_docx(typed_data)
+
+        def tokenize(text):
+            return re.findall(r"\S+", text)
+
+        from difflib import SequenceMatcher
+
+        original_words = tokenize(original_text)
+        typed_words = tokenize(typed_text)
+
+        matcher = SequenceMatcher(
+            None,
+            original_words,
+            typed_words,
+            autojunk=False
+        )
+
+        missing = []
+        extra = []
+
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag in ("delete", "replace"):
+                missing.extend(original_words[i1:i2])
+
+            if tag in ("insert", "replace"):
+                extra.extend(typed_words[j1:j2])
+
+        return {
+            "original_words": len(original_words),
+            "typed_words": len(typed_words),
+            "missing_count": len(missing),
+            "extra_count": len(extra),
+            "missing_words": missing,
+            "extra_words": extra
+        }
+
+    except Exception as e:
+        raise HTTPException(500, str(e))
