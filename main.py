@@ -2,13 +2,12 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from docx import Document
-from fontTools.ttLib import TTFont
-from PIL import Image
-import pytesseract
 import fitz
+import pytesseract
+from PIL import Image
 import io
 import re
-import unicodedata
+import gc
 
 app = FastAPI(title="Typing Quality Checker API")
 
@@ -20,7 +19,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.get("/")
 def home():
     return {
@@ -29,341 +27,239 @@ def home():
     }
 
 
-# DOCX TEXT EXTRACTION
 def extract_docx(data):
     doc = Document(io.BytesIO(data))
     parts = []
 
-    for paragraph in doc.paragraphs:
-        if paragraph.text.strip():
-            parts.append(paragraph.text)
+    for p in doc.paragraphs:
+        if p.text.strip():
+            parts.append(p.text)
 
     for table in doc.tables:
         for row in table.rows:
-            for cell in row.cells:
-                if cell.text.strip():
-                    parts.append(cell.text)
+            parts.append(" | ".join(cell.text for cell in row.cells))
 
     for section in doc.sections:
-        for paragraph in section.header.paragraphs:
-            if paragraph.text.strip():
-                parts.append(paragraph.text)
+        for p in section.header.paragraphs:
+            if p.text.strip():
+                parts.append(p.text)
 
-        for paragraph in section.footer.paragraphs:
-            if paragraph.text.strip():
-                parts.append(paragraph.text)
+        for p in section.footer.paragraphs:
+            if p.text.strip():
+                parts.append(p.text)
 
     return "\n".join(parts)
 
 
-# PDF TEXT EXTRACTION
-def extract_pdf(data):
+def extract_page_text(page):
+    return page.get_text("text", sort=True)
+
+
+def ocr_page(page):
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(1.5, 1.5),
+        colorspace=fitz.csGRAY,
+        alpha=False
+    )
+
+    image = Image.open(io.BytesIO(pix.tobytes("png")))
+
+    return pytesseract.image_to_string(
+        image,
+        lang="ben+eng",
+        config="--psm 3"
+    )
+
+
+def suspicious_text(text):
+    if not text or len(text.strip()) < 10:
+        return True
+
+    if "\ufffd" in text:
+        return True
+
+    bengali = len(re.findall(r"[\u0980-\u09FF]", text))
+    letters = len(re.findall(r"[A-Za-z\u0980-\u09FF]", text))
+
+    if letters > 30 and bengali / letters < 0.15:
+        return True
+
+    if re.search(r"(.)\1{8,}", text):
+        return True
+
+    return False
+
+
+def sample_pages(total):
+    indexes = {0, total // 2, total - 1}
+    return sorted(indexes)
+
+
+def extract_pdf_smart(data):
     pdf = fitz.open(stream=data, filetype="pdf")
-    try:
-        return "\n".join(
-            page.get_text("text") for page in pdf
-        )
-    finally:
-        pdf.close()
+    total = len(pdf)
 
+    if total == 0:
+        return "", "Empty PDF"
 
-# PDF OCR EXTRACTION
-def extract_pdf_ocr(data):
-    pdf = fitz.open(stream=data, filetype="pdf")
-    pages = []
+    page_texts = {}
+    bad_pages = set()
 
-    try:
-        for page in pdf:
-            pix = page.get_pixmap(
-                matrix=fitz.Matrix(2, 2),
-                alpha=False
-            )
+    # First pass: fast native extraction of every page
+    for i in range(total):
+        page_text = extract_page_text(pdf[i])
+        page_texts[i] = page_text
 
-            image = Image.open(
-                io.BytesIO(pix.tobytes("png"))
-            )
+        if suspicious_text(page_text):
+            bad_pages.add(i)
 
-            try:
-                text = pytesseract.image_to_string(
-                    image,
-                    lang="ben+eng"
-                )
-                pages.append(text)
-            finally:
-                image.close()
+    # Check a few sample pages with OCR
+    samples = sample_pages(total)
+    global_bad = False
 
-        return "\n".join(pages)
+    for i in samples:
+        native = page_texts[i]
+        ocr = ocr_page(pdf[i])
 
-    finally:
-        pdf.close()
+        if suspicious_text(native) and not suspicious_text(ocr):
+            bad_pages.add(i)
 
+        elif (
+            len(ocr.strip()) > 20
+            and len(native.strip()) > 20
+            and len(ocr.strip()) > len(native.strip()) * 0.5
+        ):
+            native_bangla = len(re.findall(r"[\u0980-\u09FF]", native))
+            ocr_bangla = len(re.findall(r"[\u0980-\u09FF]", ocr))
 
-# TEXT QUALITY SCORING
-def text_quality_score(text):
-    if not text.strip():
-        return 0
+            if native_bangla == 0 and ocr_bangla > 10:
+                global_bad = True
 
-    visible_chars = [
-        char for char in text if not char.isspace()
-    ]
+        del ocr
+        gc.collect()
 
-    if not visible_chars:
-        return 0
+    # If samples suggest broken font mapping, OCR all pages
+    if global_bad:
+        bad_pages = set(range(total))
 
-    total = len(visible_chars)
+    # OCR only selected pages
+    for i in sorted(bad_pages):
+        ocr = ocr_page(pdf[i])
 
-    valid_chars = sum(
-        1 for char in visible_chars
-        if char.isprintable()
-        and unicodedata.category(char) not in ("Co", "Cs")
+        if len(ocr.strip()) > len(page_texts[i].strip()):
+            page_texts[i] = ocr
+
+        gc.collect()
+
+    result = "\n\n".join(
+        f"--- Page {i + 1} ---\n{page_texts[i]}"
+        for i in range(total)
     )
 
-    bengali_count = len(
-        re.findall(r"[\u0980-\u09FF]", text)
+    method = (
+        "Smart OCR - all pages"
+        if global_bad
+        else f"Smart OCR - {len(bad_pages)} pages"
     )
 
-    alphabetic_count = sum(
-        1 for char in text if char.isalpha()
-    )
-
-    repeated_marks = len(
-        re.findall(r"([\u09BE-\u09CC])\1+", text)
-    )
-
-    replacement_count = text.count("\ufffd")
-
-    score = (valid_chars / total) * 100
-
-    if alphabetic_count > 0 and bengali_count > 0:
-        bengali_ratio = bengali_count / alphabetic_count
-        score += bengali_ratio * 10
-
-    score -= repeated_marks * 8
-    score -= replacement_count * 20
-
-    return round(max(0, min(110, score)), 2)
+    pdf.close()
+    return result, method
 
 
-# MAIN FILE EXTRACTION
 @app.post("/extract")
 async def extract_file(file: UploadFile = File(...)):
     data = await file.read()
-    filename = (file.filename or "").lower()
+
+    if not data:
+        raise HTTPException(400, "Empty file")
+
+    filename = file.filename.lower()
 
     try:
         if filename.endswith(".docx"):
             text = extract_docx(data)
-
-            return {
-                "filename": file.filename,
-                "characters": len(text),
-                "method": "DOCX Text Extraction",
-                "text": text
-            }
+            method = "DOCX Extraction"
 
         elif filename.endswith(".pdf"):
+            text, method = extract_pdf_smart(data)
 
-            # First: Normal PDF extraction
-            pdf_text = extract_pdf(data)
-
-            # Second: OCR extraction
-            ocr_text = extract_pdf_ocr(data)
-
-            # Compare both results
-            pdf_score = text_quality_score(pdf_text)
-            ocr_score = text_quality_score(ocr_text)
-
-            if ocr_score > pdf_score:
-                final_text = ocr_text
-                method = "Bengali OCR"
-            else:
-                final_text = pdf_text
-                method = "PDF Text Extraction"
-
-            return {
-                "filename": file.filename,
-                "characters": len(final_text),
-                "method": method,
-                "quality_scores": {
-                    "pdf_text_score": pdf_score,
-                    "ocr_score": ocr_score
-                },
-                "text": final_text
-            }
+        elif filename.endswith(".txt"):
+            text = data.decode("utf-8", errors="replace")
+            method = "TXT Extraction"
 
         else:
             raise HTTPException(
-                status_code=400,
-                detail="Only PDF and DOCX files are supported"
+                400,
+                "Only PDF, DOCX and TXT files are supported"
             )
+
+        return {
+            "filename": file.filename,
+            "characters": len(text),
+            "method": method,
+            "text": text
+        }
 
     except HTTPException:
         raise
 
     except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not extract text: {str(e)}"
-        )
+        raise HTTPException(500, str(e))
 
 
-# PDF FONT CHECK
 @app.post("/pdf-fonts")
-async def check_pdf_fonts(file: UploadFile = File(...)):
+async def pdf_fonts(file: UploadFile = File(...)):
     data = await file.read()
+    pdf = fitz.open(stream=data, filetype="pdf")
 
-    if not (file.filename or "").lower().endswith(".pdf"):
-        raise HTTPException(400, "Please upload a PDF file")
+    fonts = []
 
-    try:
-        pdf = fitz.open(stream=data, filetype="pdf")
-        results = []
+    for page_no, page in enumerate(pdf):
+        for font in page.get_fonts(full=True):
+            fonts.append({
+                "page": page_no + 1,
+                "font": font[3],
+                "type": font[1],
+                "encoding": font[2]
+            })
 
-        try:
-            for page_number, page in enumerate(pdf, start=1):
-                for font in page.get_fonts(full=True):
-                    xref = font[0]
-
-                    item = {
-                        "page": page_number,
-                        "font_name": font[3],
-                        "font_type": font[2],
-                        "encoding": font[5],
-                        "unicode_cmap": "Unknown"
-                    }
-
-                    try:
-                        extracted = pdf.extract_font(xref)
-                        font_data = extracted[3]
-
-                        if font_data:
-                            font_obj = TTFont(
-                                io.BytesIO(font_data),
-                                lazy=True
-                            )
-
-                            item["unicode_cmap"] = any(
-                                table.isUnicode()
-                                for table in font_obj["cmap"].tables
-                            )
-
-                            font_obj.close()
-
-                    except Exception:
-                        item["unicode_cmap"] = "Could not inspect"
-
-                    results.append(item)
-
-        finally:
-            pdf.close()
-
-        return {
-            "filename": file.filename,
-            "fonts_found": len(results),
-            "fonts": results
-        }
-
-    except Exception as e:
-        raise HTTPException(400, str(e))
+    pdf.close()
+    return {"fonts": fonts}
 
 
-# PDF DEBUG
 @app.post("/pdf-debug")
-async def debug_pdf(file: UploadFile = File(...)):
+async def pdf_debug(file: UploadFile = File(...)):
     data = await file.read()
+    pdf = fitz.open(stream=data, filetype="pdf")
 
-    if not (file.filename or "").lower().endswith(".pdf"):
-        raise HTTPException(400, "Please upload a PDF file")
+    result = []
 
-    try:
-        pdf = fitz.open(stream=data, filetype="pdf")
-        results = []
+    for i, page in enumerate(pdf):
+        result.append({
+            "page": i + 1,
+            "text": page.get_text("text")[:2000]
+        })
 
-        try:
-            for page_number, page in enumerate(pdf, start=1):
-                page_data = {
-                    "page": page_number,
-                    "extracted_text": page.get_text("text"),
-                    "text_spans": []
-                }
-
-                blocks = page.get_text("dict")["blocks"]
-
-                for block in blocks:
-                    if "lines" not in block:
-                        continue
-
-                    for line in block["lines"]:
-                        for span in line["spans"]:
-                            page_data["text_spans"].append({
-                                "text": span["text"],
-                                "font": span["font"],
-                                "size": span["size"],
-                                "bbox": list(span["bbox"])
-                            })
-
-                results.append(page_data)
-
-        finally:
-            pdf.close()
-
-        return {
-            "filename": file.filename,
-            "pages": len(results),
-            "debug": results
-        }
-
-    except Exception as e:
-        raise HTTPException(400, str(e))
+    pdf.close()
+    return {"pages": result}
 
 
-# SEPARATE OCR TEST
 @app.post("/ocr-test")
 async def ocr_test(file: UploadFile = File(...)):
     data = await file.read()
+    pdf = fitz.open(stream=data, filetype="pdf")
 
-    if not (file.filename or "").lower().endswith(".pdf"):
-        raise HTTPException(400, "Please upload a PDF file")
+    results = []
 
-    try:
-        pdf = fitz.open(stream=data, filetype="pdf")
-        results = []
+    for i, page in enumerate(pdf):
+        results.append({
+            "page": i + 1,
+            "text": ocr_page(page)
+        })
 
-        try:
-            for page_number, page in enumerate(pdf, start=1):
-                pix = page.get_pixmap(
-                    matrix=fitz.Matrix(2, 2),
-                    alpha=False
-                )
-
-                image = Image.open(
-                    io.BytesIO(pix.tobytes("png"))
-                )
-
-                try:
-                    text = pytesseract.image_to_string(
-                        image,
-                        lang="ben+eng"
-                    )
-                finally:
-                    image.close()
-
-                results.append({
-                    "page": page_number,
-                    "text": text
-                })
-
-        finally:
-            pdf.close()
-
-        return {
-            "filename": file.filename,
-            "pages": len(results),
-            "ocr_text": results
-        }
-
-    except Exception as e:
-        raise HTTPException(
-            400,
-            f"OCR failed: {str(e)}"
-        )
+    pdf.close()
+    return {
+        "filename": file.filename,
+        "pages": len(results),
+        "ocr_text": results
+    }
